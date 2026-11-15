@@ -1,31 +1,40 @@
-// The brief's three documents and the catalog probe.
+// Reading the brief's three documents, then probing the catalogs.
 //
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) carries three JSON documents, and the prose around
-// them does not matter: this file finds each by its `schema` member.
+// A trial's brief (the file MAKEFUN_PROMPT_FILE names) holds three JSON
+// documents, and the prose between them is irrelevant: this file picks
+// each one out by its `schema` member.
 //
-//   - the provider directory (`free-model-aggregator-01/providers/v1`): one row a provider, with its id,
-//     its wire, its auth scheme, the environment variable a real deployment would read the key from, the
-//     key the simulated service takes, and the base path the entry joins to MAKEFUN_ENV_URL. A directory
-//     entry may give an absolute base_url instead of a path; joinBase takes either.
-//   - the quality table (`free-model-aggregator-01/ratings/v1`): each model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and whether it is free. The
-//     scorer ranks an answer by its rating; a paid model is never a legal pick. This baseline reads the
-//     table's capability columns and free flag (the sealed truth, where a row exists) but never its
-//     rating (`--list` shows why in main.ts's header, and the routing TODO there names the gap).
-//   - the workload manifest (`free-model-aggregator-01/workload/v1`): the requests the client will send,
-//     in order, each with its api, whether it streams, its weight and the requirements a model must meet
-//     to serve it.
+//   - the provider directory (`free-model-aggregator-01/providers/v1`): a
+//     row per provider, carrying its id, its protocol, its auth scheme,
+//     the environment variable a real deployment would take the key
+//     from, the key the simulated service accepts, and the base path the
+//     entry joins onto MAKEFUN_ENV_URL. A directory row may carry an
+//     absolute base_url in place of a path; joinBase accepts either.
+//   - the quality table (`free-model-aggregator-01/ratings/v1`): every
+//     model's public rating in milli-points, what it can do (tools,
+//     vision, JSON mode, context length) and whether it is free. The
+//     scorer grades a reply by its rating; a paid model is never a
+//     legal pick. This baseline reads the table's capability columns and
+//     free flag (the sealed truth, where a row exists) but never its
+//     rating (`--list` shows why in main.ts's header, and the routing
+//     TODO there names the gap).
+//   - the workload manifest (`free-model-aggregator-01/workload/v1`):
+//     the requests the client will send, in order, each with its api,
+//     whether it streams, its weight and the needs a model must meet to
+//     answer it.
 //
-// It then probes each provider's catalog route in the provider's own wire:
+// Each provider's catalog route is then probed in the provider's own
+// protocol:
 //
 //   openai     GET <base>/v1/models          Authorization: Bearer <key>
 //   anthropic  GET <base>/v1/models          x-api-key: <key>, anthropic-version: 2023-06-01
 //   gemini     GET <base>/v1beta/models      x-goog-api-key: <key>
 //
-// A probe that fails (a refused connection, a non-2xx, a body that is not JSON) leaves its provider out of
-// the catalog and gets no traffic; the trial goes on. Everything here is deterministic: no clock, no
-// randomness, so `node main.ts --list` and the register body build the same document (main.ts prints or
-// posts this one object).
+// A probe that fails (a refused connection, a non-2xx, a body that is
+// not JSON) drops its provider from the catalog and sends it no traffic;
+// the trial carries on. Everything here is deterministic: no clock, no
+// chance, so `node main.ts --list` and the register body build the same
+// document (main.ts prints or posts this one object).
 
 import { readFileSync } from 'node:fs';
 
@@ -150,93 +159,93 @@ export interface Capabilities {
 }
 
 /** A base path joined to the env's URL; an absolute base_url is used as it stands. */
-export function joinBase(envUrl: string, base: string): string {
-  const b = base.trim();
-  if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, '');
-  const prefix = envUrl.replace(/\/+$/, '');
-  if (b === '') return prefix;
-  return `${prefix}${b.startsWith('/') ? '' : '/'}${b.replace(/\/+$/, '')}`;
+export function joinBase(envUrl: string, tail: string): string {
+  const cleaned = tail.trim();
+  if (/^https?:\/\//i.test(cleaned)) return cleaned.replace(/\/+$/, '');
+  const root = envUrl.replace(/\/+$/, '');
+  if (cleaned === '') return root;
+  return `${root}${cleaned.startsWith('/') ? '' : '/'}${cleaned.replace(/\/+$/, '')}`;
 }
 
 /** The headers a provider wants its key in. */
-export function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
-  if (key === '') return {};
-  if (auth === 'bearer') return { authorization: `Bearer ${key}` };
-  if (auth === 'x-api-key') return { 'x-api-key': key };
-  if (auth === 'x-goog-api-key') return { 'x-goog-api-key': key };
+export function authHeaders(scheme: AuthScheme, secret: string): Record<string, string> {
+  if (secret === '') return {};
+  if (scheme === 'bearer') return { authorization: `Bearer ${secret}` };
+  if (scheme === 'x-api-key') return { 'x-api-key': secret };
+  if (scheme === 'x-goog-api-key') return { 'x-goog-api-key': secret };
   return {};
 }
 
 /** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
+function scanDocuments(text: string): Json[] {
+  const found: Json[] = [];
+  for (let at = text.indexOf('{'); at !== -1; at = text.indexOf('{', at + 1)) {
+    const close = matchingBrace(text, at);
+    if (close === -1) continue;
     try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
+      const parsed: unknown = JSON.parse(text.slice(at, close + 1));
+      if (isRecord(parsed) && typeof parsed.schema === 'string') found.push(parsed);
     } catch {
       // Not JSON on its own: look on.
     }
   }
-  return out;
+  return found;
 }
 
 /** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
+function matchingBrace(text: string, start: number): number {
+  let level = 0;
+  let quoted = false;
+  for (let pos = start; pos < text.length; pos++) {
+    const char = text[pos];
+    if (quoted) {
+      if (char === '\\') pos += 1;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === '{') level += 1;
+    else if (char === '}') {
+      level -= 1;
+      if (level === 0) return pos;
     }
   }
   return -1;
 }
 
-function stringOf(v: unknown): string {
+function asString(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
 
-function numberOrNull(v: unknown): number | null {
+function asNumberOrNull(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-function boolOrNull(v: unknown): boolean | null {
+function asBoolOrNull(v: unknown): boolean | null {
   return typeof v === 'boolean' ? v : null;
 }
 
-function providerOf(v: unknown): ProviderDirectoryEntry | null {
+function parseProvider(v: unknown): ProviderDirectoryEntry | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
-  if (id === '' || wire === null) return null;
-  const auth = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
+  const pid = asString(v.id);
+  const wireKind = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
+  if (pid === '' || wireKind === null) return null;
+  const scheme = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
   // The brief's directory writes `path` (/p/<id>, joined to $MAKEFUN_ENV_URL); a directory that spells an
   // absolute base instead may use base_path, base_url or base. Take the first non-empty, `path` first.
-  const base =
-    stringOf(v.path) !== '' ? stringOf(v.path) : stringOf(v.base_path) !== '' ? stringOf(v.base_path) : stringOf(v.base_url) !== '' ? stringOf(v.base_url) : stringOf(v.base);
-  return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
+  const root =
+    asString(v.path) !== '' ? asString(v.path) : asString(v.base_path) !== '' ? asString(v.base_path) : asString(v.base_url) !== '' ? asString(v.base_url) : asString(v.base);
+  return { id: pid, name: asString(v.name) !== '' ? asString(v.name) : pid, wire: wireKind, auth: scheme, base: root, key_env: asString(v.key_env), key: asString(v.key) };
 }
 
-function ratingOf(v: unknown): RatingRow | null {
+function parseRating(v: unknown): RatingRow | null {
   if (!isRecord(v)) return null;
-  const model = stringOf(v.model);
-  const provider = stringOf(v.provider);
+  const model = asString(v.model);
+  const provider = asString(v.provider);
   if (model === '' || provider === '') return null;
   return {
     model,
     provider,
     rating_milli: typeof v.rating_milli === 'number' && Number.isFinite(v.rating_milli) ? v.rating_milli : 0,
-    context_length: numberOrNull(v.context_length),
+    context_length: asNumberOrNull(v.context_length),
     tools: v.tools === true,
     vision: v.vision === true,
     json: v.json === true,
@@ -244,21 +253,21 @@ function ratingOf(v: unknown): RatingRow | null {
   };
 }
 
-function workloadRequestOf(v: unknown): WorkloadRequest | null {
+function parseWorkloadRequest(v: unknown): WorkloadRequest | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+  const id = asString(v.id);
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
+  const needs = isRecord(v.requires) ? v.requires : {};
   return {
     id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
     stream: v.stream === true,
     weight: v.weight === 2 ? 2 : 1,
     requires: {
-      tools: requires.tools === true,
-      vision: requires.vision === true,
-      json: requires.json === true,
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
+      tools: needs.tools === true,
+      vision: needs.vision === true,
+      json: needs.json === true,
+      ...(typeof needs.min_context === 'number' && Number.isFinite(needs.min_context) ? { min_context: needs.min_context } : {}),
     },
   };
 }
@@ -267,141 +276,141 @@ function workloadRequestOf(v: unknown): WorkloadRequest | null {
 export function readBrief(path: string): Brief {
   const directory: ProviderDirectory = { schema: PROVIDERS_SCHEMA, providers: [] };
   if (path === '') return { directory, ratings: null, workload: null, error: 'MAKEFUN_PROMPT_FILE is not set' };
-  let text: string;
+  let source: string;
   try {
-    text = readFileSync(path, 'utf8');
+    source = readFileSync(path, 'utf8');
   } catch (err) {
     return { directory, ratings: null, workload: null, error: `cannot read ${path}: ${(err as Error).message}` };
   }
-  const docs = documentsIn(text);
-  const directoryDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
-  if (directoryDoc === null || !Array.isArray(directoryDoc.providers)) {
+  const found = scanDocuments(source);
+  const dirDoc = found.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
+  if (dirDoc === null || !Array.isArray(dirDoc.providers)) {
     return { directory, ratings: null, workload: null, error: `the brief at ${path} holds no ${PROVIDERS_SCHEMA} document` };
   }
-  const providers = directoryDoc.providers.flatMap((v) => {
-    const p = providerOf(v);
-    return p === null ? [] : [p];
+  const entries = dirDoc.providers.flatMap((v) => {
+    const entry = parseProvider(v);
+    return entry === null ? [] : [entry];
   });
-  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
-  const ratingRows = ratingsDoc !== null && Array.isArray(ratingsDoc.ratings) ? ratingsDoc.ratings : null;
-  const ratings: RatingsFile | null =
-    ratingsDoc === null || ratingRows === null
+  const ratesDoc = found.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
+  const rows = ratesDoc !== null && Array.isArray(ratesDoc.ratings) ? ratesDoc.ratings : null;
+  const table: RatingsFile | null =
+    ratesDoc === null || rows === null
       ? null
       : {
           schema: RATINGS_SCHEMA,
-          ratings: ratingRows.flatMap((v) => {
-            const r = ratingOf(v);
-            return r === null ? [] : [r];
+          ratings: rows.flatMap((v) => {
+            const row = parseRating(v);
+            return row === null ? [] : [row];
           }),
-          best: Array.isArray(ratingsDoc.best)
-            ? ratingsDoc.best.flatMap((v) => {
-                if (!isRecord(v) || stringOf(v.id) === '') return [];
-                return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
+          best: Array.isArray(ratesDoc.best)
+            ? ratesDoc.best.flatMap((v) => {
+                if (!isRecord(v) || asString(v.id) === '') return [];
+                return [{ id: asString(v.id), rating_milli: asNumberOrNull(v.rating_milli) ?? 0 }];
               })
             : [],
         };
-  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
-  const workload: WorkloadFile | null =
-    workloadDoc === null || !Array.isArray(workloadDoc.manifest)
+  const workDoc = found.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
+  const load: WorkloadFile | null =
+    workDoc === null || !Array.isArray(workDoc.manifest)
       ? null
       : {
           schema: WORKLOAD_SCHEMA,
-          manifest: workloadDoc.manifest.flatMap((v) => {
-            const w = workloadRequestOf(v);
-            return w === null ? [] : [w];
+          manifest: workDoc.manifest.flatMap((v) => {
+            const req = parseWorkloadRequest(v);
+            return req === null ? [] : [req];
           }),
         };
-  return { directory: { schema: PROVIDERS_SCHEMA, providers }, ratings, workload, error: null };
+  return { directory: { schema: PROVIDERS_SCHEMA, providers: entries }, ratings: table, workload: load, error: null };
 }
 
 /** The rating row of one provider's model, when the quality table has one. */
-export function ratingOfModel(ratings: RatingsFile | null, providerId: string, modelId: string): RatingRow | null {
-  if (ratings === null) return null;
-  return ratings.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
+export function ratingOfModel(table: RatingsFile | null, provider: string, model: string): RatingRow | null {
+  if (table === null) return null;
+  return table.ratings.find((r) => r.provider === provider && r.model === model) ?? null;
 }
 
 /**
  * Whether a model is free: the quality table's row where it has one (it is the sealed truth), the
  * listing's own word where it does not, and paid when neither says. A paid model is never routed.
  */
-export function modelFree(model: ProbedModel, row: RatingRow | null): boolean {
-  if (row !== null) return row.free;
-  return model.free ?? false;
+export function modelFree(entry: ProbedModel, rating: RatingRow | null): boolean {
+  if (rating !== null) return rating.free;
+  return entry.free ?? false;
 }
 
 /** What a model can do: the quality table's row where it has one, the listing's own fields where it does not. */
-export function capabilitiesOf(model: ProbedModel, row: RatingRow | null): Capabilities {
+export function capabilitiesOf(entry: ProbedModel, rating: RatingRow | null): Capabilities {
   return {
-    context_length: row?.context_length ?? model.context_length ?? null,
-    tools: row?.tools ?? model.tools ?? null,
-    vision: row?.vision ?? model.vision ?? null,
-    json: row?.json ?? model.json ?? null,
+    context_length: rating?.context_length ?? entry.context_length ?? null,
+    tools: rating?.tools ?? entry.tools ?? null,
+    vision: rating?.vision ?? entry.vision ?? null,
+    json: rating?.json ?? entry.json ?? null,
   };
 }
 
 /** Whether a model's capabilities meet one request's requirements. An unknown capability never meets one. */
-export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
+export function meetsRequirements(needs: Requirement, able: Capabilities): boolean {
+  if (needs.tools === true && able.tools !== true) return false;
+  if (needs.vision === true && able.vision !== true) return false;
+  if (needs.json === true && able.json !== true) return false;
+  if (needs.min_context !== undefined && (able.context_length === null || able.context_length < needs.min_context)) return false;
   return true;
 }
 
 /** A price field of a listing: 0 when every price is zero, null when the listing says nothing about price. */
-function zeroPriced(v: Json): boolean | null {
-  const pricing = isRecord(v.pricing) ? v.pricing : null;
-  if (pricing === null) return null;
-  const values = Object.values(pricing).flatMap((x) => {
+function pricedZero(v: Json): boolean | null {
+  const priceMap = isRecord(v.pricing) ? v.pricing : null;
+  if (priceMap === null) return null;
+  const amounts = Object.values(priceMap).flatMap((x) => {
     if (typeof x === 'number') return [x];
     if (typeof x === 'string' && x.trim() !== '') return [Number(x)];
     return [];
   });
-  if (values.length === 0) return null;
-  return values.every((n) => Number.isFinite(n) && n === 0);
+  if (amounts.length === 0) return null;
+  return amounts.every((n) => Number.isFinite(n) && n === 0);
 }
 
 /** One model as a listing wrote it, in whichever wire's spelling. */
-function modelIn(wire: Wire, v: unknown): ProbedModel | null {
+function parseModel(wire: Wire, v: unknown): ProbedModel | null {
   if (!isRecord(v)) return null;
-  const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
-  if (id === '') return null;
-  const context = numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
+  const mid = wire === 'gemini' ? asString(v.name).replace(/^models\//, '') : asString(v.id);
+  if (mid === '') return null;
+  const span = asNumberOrNull(v.context_length) ?? asNumberOrNull(v.context_window) ?? asNumberOrNull(v.inputTokenLimit);
   return {
-    id,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
-    context_length: context,
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    id: mid,
+    display_name: asString(v.display_name) !== '' ? asString(v.display_name) : asString(v.displayName) !== '' ? asString(v.displayName) : mid,
+    free: asBoolOrNull(v.free) ?? pricedZero(v),
+    context_length: span,
+    tools: asBoolOrNull(v.tools),
+    vision: asBoolOrNull(v.vision),
+    json: asBoolOrNull(v.json),
   };
 }
 
 /** The models one catalog route's answer listed, in its wire's shape. */
-function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
+function parseModelList(wire: Wire, body: unknown): ProbedModel[] {
   if (!isRecord(body)) return [];
-  const list = wire === 'gemini' ? body.models : body.data;
-  if (!Array.isArray(list)) return [];
-  return list.flatMap((v) => {
-    const m = modelIn(wire, v);
-    return m === null ? [] : [m];
+  const rows = wire === 'gemini' ? body.models : body.data;
+  if (!Array.isArray(rows)) return [];
+  return rows.flatMap((v) => {
+    const entry = parseModel(wire, v);
+    return entry === null ? [] : [entry];
   });
 }
 
 /** Probe one provider's catalog route, in its own wire, tolerating every failure. */
 export async function probeProvider(envUrl: string, provider: ProviderDirectoryEntry, timeoutMs = 5000): Promise<Probe> {
-  const base = joinBase(envUrl, provider.base);
-  const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
-  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  const origin = joinBase(envUrl, provider.base);
+  const target = provider.wire === 'gemini' ? `${origin}/v1beta/models` : `${origin}/v1/models`;
+  const heads: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
+  if (provider.wire === 'anthropic') heads['anthropic-version'] = '2023-06-01';
   try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
-    const body: unknown = await res.json();
-    return { provider, ok: true, status: res.status, models: modelsIn(provider.wire, body), error: null };
+    const reply = await fetch(target, { headers: heads, signal: AbortSignal.timeout(timeoutMs) });
+    if (!reply.ok) return { provider, ok: false, status: reply.status, models: [], error: `GET ${target} answered HTTP ${reply.status}` };
+    const decoded: unknown = await reply.json();
+    return { provider, ok: true, status: reply.status, models: parseModelList(provider.wire, decoded), error: null };
   } catch (err) {
-    return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
+    return { provider, ok: false, status: 0, models: [], error: `GET ${target} failed: ${(err as Error).message}` };
   }
 }
 
@@ -414,19 +423,19 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
  * for byte. The scorer compares a reported base_url by its path suffix, so the path passes exactly as the
  * joined URL does; the joined URL reaches a provider, the path names it.
  */
-export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings: RatingsFile | null): CatalogReport {
-  const providers: CatalogProvider[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      const row = ratingOfModel(ratings, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
+export function buildCatalog(_origin: string, probes: readonly Probe[], table: RatingsFile | null): CatalogReport {
+  const listed: CatalogProvider[] = [];
+  for (const result of probes) {
+    if (!result.ok) continue;
+    const known = new Set<string>();
+    const entries: CatalogModel[] = [];
+    for (const entry of [...result.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+      if (known.has(entry.id)) continue;
+      known.add(entry.id);
+      const rating = ratingOfModel(table, result.provider.id, entry.id);
+      entries.push({ id: entry.id, free: modelFree(entry, rating), context_length: rating?.context_length ?? entry.context_length ?? null });
     }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
+    listed.push({ id: result.provider.id, base_url: result.provider.base, key_env: result.provider.key_env, wire: result.provider.wire, models: entries });
   }
-  return { providers };
+  return { providers: listed };
 }
