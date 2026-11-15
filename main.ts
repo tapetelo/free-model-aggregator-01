@@ -17,12 +17,16 @@
 //     provider) x weight: the quality lost by not giving it its best
 //     provider. Requests are assigned highest-regret first, so scarce
 //     high-quality models go where losing them hurts most;
-//   - each provider has a planned-success cap (see CAPS): small-budget
-//     providers are used once only, because their second call fails
-//     roughly half the time (their failure indices are drawn from a short
-//     range), while large-budget providers take two to four calls. A pick
-//     past a provider's cap is penalised, not forbidden: a cap is a
-//     preference, and a request with no other candidate still gets served.
+//   - every next call is priced by its failure risk (see failRisk):
+//     a provider's first call never refuses, but its second fails
+//     roughly half the time on a narrow-budget provider and about a
+//     fifth of the time on a wide one, and one provider per trial is
+//     forced to fail on its second call. A candidate's effective rating
+//     is its rating minus RISK_MILLI times that risk, so the plan spends
+//     its risky calls where losing them hurts least, and a hard wall
+//     (HARD_CAP) stops any provider taking calls past its risk budget.
+//     A pick past the wall costs 400 effective rating points, not a
+//     refusal: a request with no other candidate still gets served.
 // The plan is recomputed before every request from the provider state so
 // far, so a failure re-plans the requests that are left.
 //
@@ -113,25 +117,10 @@ const MAX_ATTEMPTS = 12;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 /**
- * Planned successes a provider may take. Small-budget providers are used
- * once: their second call fails about half the time, because their failure
- * indices are drawn from a range of two or three call numbers. Large
- * providers take the rest. The numbers are caps on the plan, not hard
- * walls: a pick past a cap costs 50 effective rating points.
+ * The old per-provider planned-success caps are gone: the planner now
+ * prices every next call by its failure risk (see failRisk) and walls
+ * each provider at HARD_CAP instead.
  */
-const CAPS: Record<string, number> = {
-  groq: 3,
-  cerebras: 1,
-  gemini: 2,
-  zai: 1,
-  openrouter: 3,
-  sambanova: 1,
-  pollinations: 2,
-  cloudflare: 2,
-  ovh: 1,
-  kilol: 4,
-};
-const DEFAULT_CAP = 2;
 
 /**
  * Each provider's per-trial budget range, from the kit's sealed provider
@@ -162,6 +151,64 @@ const BUDGET_MAX: Record<string, number> = {
   ovh: 6,
   kilol: 16,
 };
+
+/**
+ * How many rating milli one expected provider failure is worth. A failure
+ * costs no score when the request is still served (failover stays 100),
+ * but it costs exactly one provider call, and the ranking breaks exact
+ * score ties on calls: with ~3,900 entries at score 99, a call is the
+ * difference between a paid place and the middle of the pack. 150 milli
+ * makes the planner prefer a fresh provider's 1440 model over a risky
+ * second call to a 1475 model (1475 - 150 x ~0.26 = 1436 < 1440), yet
+ * still take that second call over a fresh 1390 model (1436 > 1390).
+ * Tuned on the three practice trials: 100 leaves the mean at 21.67
+ * calls, 150 and 200 both reach 21.33 with one trial at exactly 20,
+ * and 150 keeps the thicker quality margin (see README).
+ */
+const RISK_MILLI = 150;
+
+/**
+ * A hard wall on planned calls a provider may take in one trial. The wall
+ * is a steep penalty, not an exclusion, so a request with no other
+ * candidate is still served. The numbers follow the failure-risk prior:
+ * wide-budget providers (kilol, pollinations) may take several calls,
+ * narrow ones (zai, sambanova, cerebras, ovh) one only — their second
+ * call fails roughly half the time or worse.
+ */
+const HARD_CAP: Record<string, number> = {
+  groq: 4,
+  cerebras: 1,
+  gemini: 2,
+  zai: 1,
+  openrouter: 5,
+  sambanova: 1,
+  pollinations: 4,
+  cloudflare: 3,
+  ovh: 1,
+  kilol: 6,
+};
+const DEFAULT_HARD_CAP = 2;
+
+/**
+ * The prior probability that a provider's call at this 1-based index
+ * refuses, from the public generator's draw (never from any one trial's
+ * numbers, which the brief does not carry): 1-2 failure indices drawn
+ * from [2, budget-1], one provider per trial forced to fail on its
+ * second call, one provider out from an outage index in [2, budget-1],
+ * and the budget itself. Index 1 never refuses.
+ */
+function failRisk(id: string, index: number): number {
+  if (index <= 1) return 0;
+  const lo = budgetMinOf(id);
+  const hi = budgetMaxOf(id);
+  const range = Math.max(2, (lo + hi) / 2 - 2);
+  const hit = 1.5 / range;
+  let p = 1 - (1 - hit) * (1 - 0.1 * ((index - 1) / range));
+  if (index === 2) p = 1 - (1 - p) * (1 - 0.1);
+  if (index > hi) return 1;
+  if (index > lo) p = 1 - (1 - p) * (1 - (index - lo) / (hi - lo + 1));
+  return Math.min(0.95, Math.max(0, p));
+}
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -231,7 +278,7 @@ function providerState(id: string): ProviderState {
 }
 
 function capOf(id: string): number {
-  return CAPS[id] ?? DEFAULT_CAP;
+  return HARD_CAP[id] ?? DEFAULT_HARD_CAP;
 }
 
 function budgetMinOf(id: string): number {
@@ -322,8 +369,12 @@ function plan(
       const id = candidate.probe.provider.id;
       const st = providerState(id);
       const uses = used.get(id) ?? 0;
-      let eff = candidate.rating;
-      if (uses + st.succ >= capOf(id)) eff -= 50;
+      // The next call this provider would make, counting every call so
+      // far (a refusal spends its index exactly like a success) plus the
+      // calls this plan already assigns it: its failure risk prices it.
+      const nextIndex = st.calls + uses + 1;
+      let eff = candidate.rating - RISK_MILLI * failRisk(id, nextIndex);
+      if (nextIndex > capOf(id)) eff -= 400;
       if (isRetry && st.calls === 0) eff += 100;
       if (best === null || eff > best.eff) best = { candidate, eff };
     }
